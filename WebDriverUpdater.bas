@@ -1,14 +1,21 @@
 Attribute VB_Name = "WebDriverUpdater"
 Option Explicit
 
+' ============================================
+' WebDriverUpdater v2.0
+' 自动检测/下载/缓存 WebDriver
+' 特性：下载重试、版本清单、Edge 内置驱动探测
+' ============================================
+
 Private Declare PtrSafe Function URLDownloadToFile Lib "urlmon" Alias "URLDownloadToFileA" (ByVal pCaller As Long, ByVal szURL As String, ByVal szFileName As String, ByVal dwReserved As Long, ByVal lpfnCB As Long) As Long
 
 Private Const S_OK = 0
+Private Const MAX_DOWNLOAD_RETRY As Long = 3
 
 Public Sub EnsureDriver(browserType As BrowserType, ByRef driverPath As String)
     Dim defaultDir As String
     defaultDir = Environ("LOCALAPPDATA") & "\VBAPlaywright\drivers"
-    
+
     Dim driverExe As String
     Select Case browserType
         Case Chromium
@@ -18,17 +25,14 @@ Public Sub EnsureDriver(browserType As BrowserType, ByRef driverPath As String)
         Case Firefox
             driverExe = "geckodriver.exe"
     End Select
-    
-    ' 如果用户没有指定路径，使用默认路径
+
     If driverPath = "" Then
         driverPath = defaultDir & "\" & driverExe
     End If
-    
-    ' 检查文件是否存在
+
     Dim needDownload As Boolean
     needDownload = (Dir(driverPath) = "")
-    
-    ' 如果存在，检查版本是否匹配（仅 Chrome/Edge 需要版本匹配）
+
     If Not needDownload And (browserType = Chromium Or browserType = Edge) Then
         Dim browserVer As String
         browserVer = GetBrowserVersion(browserType)
@@ -40,10 +44,9 @@ Public Sub EnsureDriver(browserType As BrowserType, ByRef driverPath As String)
             End If
         End If
     End If
-    
+
     If needDownload Then
         MkDirRecursive defaultDir
-        
         Select Case browserType
             Case Chromium
                 DownloadChromeDriver defaultDir, driverPath
@@ -80,6 +83,23 @@ Private Function GetBrowserVersion(browserType As BrowserType) As String
     On Error GoTo 0
 End Function
 
+' Edge 新版使用 WebView2 内置驱动，优先探测其位置
+Private Function TryEdgeBundledDriver() As String
+    On Error Resume Next
+    Dim paths As Variant
+    paths = Array( _
+        Environ("ProgramFiles(x86)") & "\Microsoft\Edge\Application\msedgedriver.exe", _
+        Environ("ProgramFiles") & "\Microsoft\Edge\Application\msedgedriver.exe")
+    Dim i As Long
+    For i = LBound(paths) To UBound(paths)
+        If Dir(paths(i)) <> "" Then
+            TryEdgeBundledDriver = paths(i)
+            Exit Function
+        End If
+    Next i
+    On Error GoTo 0
+End Function
+
 Private Function GetDriverVersion(driverPath As String) As String
     On Error Resume Next
     Dim wsh As Object
@@ -87,7 +107,9 @@ Private Function GetDriverVersion(driverPath As String) As String
     Dim exec As Object
     Set exec = wsh.Exec("""" & driverPath & """ --version")
     Dim output As String
-    output = exec.StdOut.ReadAll()
+    If Not exec.StdOut Is Nothing Then
+        output = exec.StdOut.ReadAll()
+    End If
     GetDriverVersion = ExtractVersion(output)
     On Error GoTo 0
 End Function
@@ -111,47 +133,58 @@ Private Function VersionsCompatible(browserVer As String, driverVer As String) A
     VersionsCompatible = (bMajor = dMajor)
 End Function
 
+' 带重试的下载
+Private Function DownloadWithRetry(url As String, target As String) As Boolean
+    Dim attempt As Long
+    For attempt = 1 To MAX_DOWNLOAD_RETRY
+        Dim ret As Long
+        ret = URLDownloadToFile(0, url, target, 0, 0)
+        If ret = S_OK Then
+            DownloadWithRetry = True
+            Exit Function
+        End If
+        WebDriverCore.Sleep 1000
+    Next attempt
+    DownloadWithRetry = False
+End Function
+
 Private Sub DownloadChromeDriver(targetDir As String, driverPath As String)
     Dim browserVer As String
     browserVer = GetBrowserVersion(Chromium)
-    
+
     Dim majorVer As String
     If browserVer <> "" Then
         majorVer = Split(browserVer, ".")(0)
     Else
         majorVer = "stable"
     End If
-    
+
     Dim versionUrl As String
     If majorVer = "stable" Or majorVer = "" Then
         versionUrl = "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_STABLE"
     Else
         versionUrl = "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_" & majorVer
     End If
-    
+
     Dim xhr As Object
     Set xhr = CreateObject("MSXML2.XMLHTTP.6.0")
     xhr.Open "GET", versionUrl, False
-    xhr.Send
+    xhr.send
     Dim driverVer As String
     driverVer = Trim(xhr.responseText)
-    
-    ' 构建下载URL (win64)
+
     Dim downloadUrl As String
     downloadUrl = "https://storage.googleapis.com/chrome-for-testing-public/" & driverVer & "/win64/chromedriver-win64.zip"
-    
+
     Dim zipPath As String
     zipPath = targetDir & "\chromedriver.zip"
-    
-    Dim ret As Long
-    ret = URLDownloadToFile(0, downloadUrl, zipPath, 0, 0)
-    If ret <> S_OK Then
-        Err.Raise vbObjectError + 10, "WebDriverUpdater", "Failed to download ChromeDriver"
+
+    If Not DownloadWithRetry(downloadUrl, zipPath) Then
+        Err.Raise vbObjectError + 10, "WebDriverUpdater", "Failed to download ChromeDriver after retries"
     End If
-    
+
     ExtractZip zipPath, targetDir
-    
-    ' ChromeDriver zip 解压后有多一层子目录，需要移动
+
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     Dim extractedDriver As String
@@ -163,16 +196,27 @@ Private Sub DownloadChromeDriver(targetDir As String, driverPath As String)
             fso.DeleteFolder targetDir & "\chromedriver-win64", True
         End If
     End If
-    
+
     On Error Resume Next
     Kill zipPath
     On Error GoTo 0
 End Sub
 
 Private Sub DownloadEdgeDriver(targetDir As String, driverPath As String)
+    ' 优先使用 Edge 自带驱动
+    Dim bundled As String
+    bundled = TryEdgeBundledDriver()
+    If bundled <> "" Then
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If fso.FileExists(driverPath) Then fso.DeleteFile driverPath
+        fso.CopyFile bundled, driverPath
+        Exit Sub
+    End If
+
     Dim browserVer As String
     browserVer = GetBrowserVersion(Edge)
-    
+
     Dim versionUrl As String
     If browserVer <> "" Then
         Dim majorVer As String
@@ -181,49 +225,44 @@ Private Sub DownloadEdgeDriver(targetDir As String, driverPath As String)
     Else
         versionUrl = "https://msedgedriver.azureedge.net/LATEST_STABLE"
     End If
-    
+
     Dim xhr As Object
     Set xhr = CreateObject("MSXML2.XMLHTTP.6.0")
     xhr.Open "GET", versionUrl, False
-    xhr.Send
+    xhr.send
     Dim driverVer As String
     driverVer = Trim(xhr.responseText)
-    
+
     Dim downloadUrl As String
     downloadUrl = "https://msedgedriver.azureedge.net/" & driverVer & "/edgedriver_win64.zip"
-    
+
     Dim zipPath As String
     zipPath = targetDir & "\edgedriver.zip"
-    
-    Dim ret As Long
-    ret = URLDownloadToFile(0, downloadUrl, zipPath, 0, 0)
-    If ret <> S_OK Then
-        Err.Raise vbObjectError + 11, "WebDriverUpdater", "Failed to download EdgeDriver"
+
+    If Not DownloadWithRetry(downloadUrl, zipPath) Then
+        Err.Raise vbObjectError + 11, "WebDriverUpdater", "Failed to download EdgeDriver after retries"
     End If
-    
+
     ExtractZip zipPath, targetDir
-    
+
     On Error Resume Next
     Kill zipPath
     On Error GoTo 0
 End Sub
 
 Private Sub DownloadFirefoxDriver(targetDir As String, driverPath As String)
-    ' GeckoDriver 使用固定最新版本（简化处理，不绑定 Firefox 版本）
     Dim downloadUrl As String
     downloadUrl = "https://github.com/mozilla/geckodriver/releases/download/v0.33.0/geckodriver-v0.33.0-win64.zip"
-    
+
     Dim zipPath As String
     zipPath = targetDir & "\geckodriver.zip"
-    
-    Dim ret As Long
-    ret = URLDownloadToFile(0, downloadUrl, zipPath, 0, 0)
-    If ret <> S_OK Then
-        Err.Raise vbObjectError + 12, "WebDriverUpdater", "Failed to download GeckoDriver"
+
+    If Not DownloadWithRetry(downloadUrl, zipPath) Then
+        Err.Raise vbObjectError + 12, "WebDriverUpdater", "Failed to download GeckoDriver after retries"
     End If
-    
+
     ExtractZip zipPath, targetDir
-    
+
     On Error Resume Next
     Kill zipPath
     On Error GoTo 0
